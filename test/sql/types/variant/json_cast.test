@@ -192,3 +192,15 @@ select {'var': a::JSON}::VARIANT from base;
 {'var': NULL}
 {'var': {'a': NULL, 'b': [1, 2, true, hello]}}
 {'var': true}
+
+# Deeply nested JSON must be rejected instead of overflowing the stack
+statement error nesting depth
+select (repeat('[', 200) || '1' || repeat(']', 200))::JSON::VARIANT;
+
+statement error nesting depth
+select (repeat('{"a":', 200) || '1' || repeat('}', 200))::JSON::VARIANT;
+
+query I
+select length(((repeat('[', 128) || '1' || repeat(']', 128))::JSON::VARIANT)::JSON);
+----
+257
