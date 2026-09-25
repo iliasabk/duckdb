@@ -298,6 +298,13 @@ TEST_CASE("Test arrow in C API", "[capi][arrow]") {
 	// this likely requires nanoarrow to create the array to scan
 }
 
+static void (*arrow_tracked_original_release)(ArrowArray *);
+static int arrow_tracked_release_calls;
+static void ArrowTrackedRelease(ArrowArray *array) {
+	arrow_tracked_release_calls++;
+	arrow_tracked_original_release(array);
+}
+
 TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 	CAPITester tester;
 	REQUIRE(tester.OpenDatabase(nullptr));
@@ -451,5 +458,71 @@ TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 		duckdb_destroy_error_data(&err);
 		duckdb_destroy_arrow_options(&arrow_options);
 		free((void *)names[0]);
+	}
+
+	SECTION("from_arrow: all columns share ownership of the array") {
+		// Regression test for duckdb/duckdb#26163: zero-copy columns must keep the
+		// Arrow array alive until the last referencing vector is destroyed.
+		REQUIRE_NO_FAIL(tester.Query("CREATE TABLE arr_life(a BIGINT, b BIGINT);"));
+		REQUIRE_NO_FAIL(tester.Query("INSERT INTO arr_life VALUES (1, 10), (2, 20), (3, 30), (4, 40);"));
+
+		duckdb_result result;
+		REQUIRE(duckdb_query(tester.connection, "SELECT a, b FROM arr_life ORDER BY a", &result) == DuckDBSuccess);
+		duckdb_data_chunk result_chunk = duckdb_result_get_chunk(result, 0);
+		REQUIRE(result_chunk != nullptr);
+
+		// Convert the result chunk to a struct Arrow array with children a and b
+		ArrowArray arrow_array;
+		duckdb_arrow_options arrow_options;
+		duckdb_connection_get_arrow_options(tester.connection, &arrow_options);
+		duckdb_error_data err = duckdb_data_chunk_to_arrow(arrow_options, result_chunk, &arrow_array);
+		duckdb_destroy_arrow_options(&arrow_options);
+		REQUIRE(err == nullptr);
+		REQUIRE(arrow_array.release != nullptr);
+		REQUIRE(arrow_array.n_children == 2);
+
+		// Count release calls on the parent array
+		arrow_tracked_release_calls = 0;
+		arrow_tracked_original_release = arrow_array.release;
+		arrow_array.release = ArrowTrackedRelease;
+
+		duckdb_logical_type bigint = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+		duckdb_logical_type types[2] = {bigint, bigint};
+		const char *names[2] = {"a", "b"};
+		ArrowSchemaWrapper arrow_schema_wrapper;
+		duckdb_connection_get_arrow_options(tester.connection, &arrow_options);
+		err = duckdb_to_arrow_schema(arrow_options, types, names, 2, &arrow_schema_wrapper.arrow_schema);
+		duckdb_destroy_arrow_options(&arrow_options);
+		REQUIRE(err == nullptr);
+
+		duckdb_arrow_converted_schema converted_schema = nullptr;
+		err = duckdb_schema_from_arrow(tester.connection, &arrow_schema_wrapper.arrow_schema, &converted_schema);
+		REQUIRE(err == nullptr);
+
+		duckdb_data_chunk src_chunk;
+		err = duckdb_data_chunk_from_arrow(tester.connection, &arrow_array, converted_schema, &src_chunk);
+		REQUIRE(err == nullptr);
+		REQUIRE(arrow_array.release == nullptr);
+
+		// Keep only column b alive, then destroy the source chunk
+		duckdb_data_chunk dst_chunk = duckdb_create_data_chunk(&bigint, 1);
+		duckdb_vector_reference_vector(duckdb_data_chunk_get_vector(dst_chunk, 0),
+		                               duckdb_data_chunk_get_vector(src_chunk, 1));
+		duckdb_data_chunk_set_size(dst_chunk, 4);
+		duckdb_destroy_data_chunk(&src_chunk);
+
+		// The array must not be released while column b is still referenced
+		REQUIRE(arrow_tracked_release_calls == 0);
+		auto data = static_cast<int64_t *>(duckdb_vector_get_data(duckdb_data_chunk_get_vector(dst_chunk, 0)));
+		REQUIRE(data[0] == 10);
+		REQUIRE(data[3] == 40);
+
+		// Releasing the last reference releases the array exactly once
+		duckdb_destroy_data_chunk(&dst_chunk);
+		REQUIRE(arrow_tracked_release_calls == 1);
+
+		duckdb_destroy_arrow_converted_schema(&converted_schema);
+		duckdb_destroy_logical_type(&bigint);
+		duckdb_destroy_result(&result);
 	}
 }

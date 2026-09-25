@@ -106,17 +106,22 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
 
 	auto &arrow_types = arrow_table->GetColumns();
 	dchunk->SetChildCardinality(duckdb::NumericCast<idx_t>(arrow_array->length));
+	// We need to make sure that our chunk will hold the ownership: all columns share one wrapper, so the array is
+	// released only once the last column referencing it is destroyed
+	duckdb::shared_ptr<duckdb::ArrowArrayWrapper> owned_array;
 	for (idx_t i = 0; i < dchunk->ColumnCount(); i++) {
 		auto &parent_array = *arrow_array;
 		auto &array = parent_array.children[i];
 		auto arrow_type = arrow_types.at(i);
 		auto array_physical_type = arrow_type->GetPhysicalType();
 		auto array_state = duckdb::make_uniq<duckdb::ArrowArrayScanState>(*conn->context);
-		// We need to make sure that our chunk will hold the ownership
-		array_state->owned_data = duckdb::make_shared_ptr<duckdb::ArrowArrayWrapper>();
-		array_state->owned_data->arrow_array = *arrow_array;
-		// We set it to nullptr to effectively transfer the ownership
-		arrow_array->release = nullptr;
+		if (!owned_array) {
+			owned_array = duckdb::make_shared_ptr<duckdb::ArrowArrayWrapper>();
+			owned_array->arrow_array = *arrow_array;
+			// We set it to nullptr to effectively transfer the ownership
+			arrow_array->release = nullptr;
+		}
+		array_state->owned_data = owned_array;
 		try {
 			switch (array_physical_type) {
 			case duckdb::ArrowArrayPhysicalType::DICTIONARY_ENCODED:
