@@ -196,9 +196,14 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 		}
 		if (!dict_registry[col]) {
 			dict_registry[col] = std::move(other.dict_registry[col]);
-		} else {
-			// Both threads pinned the same upstream entry, so ids match by construction; a mismatch is a producer bug.
-			D_ASSERT(dict_registry[col]->id == other.dict_registry[col]->id);
+		} else if (dict_registry[col]->id != other.dict_registry[col]->id) {
+			// Same release-UB rationale as PinDictSurvivingColumn: one side's scattered indices would decode
+			// against the other's dictionary and emit wrong join results. Fail loudly, not D_ASSERT.
+			throw InternalException("dict-surviving join: merged hash tables pinned different dictionaries for "
+			                        "column %llu ('%s' vs '%s'); build pipeline emitted more than one global "
+			                        "dictionary",
+			                        static_cast<uint64_t>(col), dict_registry[col]->id.c_str(),
+			                        other.dict_registry[col]->id.c_str());
 		}
 	}
 }
@@ -560,16 +565,31 @@ void JoinHashTable::PinDictSurvivingColumn(idx_t build_col_idx, const Vector &in
 	const auto &entry = incoming.Buffer().Cast<DictionaryBuffer>().GetEntry();
 	if (dict_registry[build_col_idx]) {
 		// Subsequent chunks wrap the same entry, so ids match by construction; a mismatch is a producer bug.
-		D_ASSERT(dict_registry[build_col_idx]->id == entry.id);
+		// Throw, not D_ASSERT: in release the chunk's indices would silently decode against the pinned
+		// dictionary and emit wrong join results.
+		if (dict_registry[build_col_idx]->id != entry.id) {
+			throw InternalException("dict-surviving join: narrowed column %llu received dictionary id '%s' but the "
+			                        "slot is pinned to id '%s'; build pipeline emitted more than one global "
+			                        "dictionary",
+			                        static_cast<uint64_t>(build_col_idx), entry.id.c_str(),
+			                        dict_registry[build_col_idx]->id.c_str());
+		}
 		return;
 	}
 	// The upstream child is a zero-copy gather: its long strings point into the producer's row-store heap, recycled
 	// before we gather on probe. Deep-copy into a self-owned entry so it outlives them.
 	const auto &upstream_child = entry.data;
 	const auto child_count = upstream_child.size();
-	// child_count fits index_width by construction (publisher sized the width to this dict). Assert so a producer
-	// that grows the child past it fails loudly instead of truncating in the UnsafeNumericCast.
-	D_ASSERT(child_count <= (idx_t(1) << (8 * index_width)));
+	// child_count fits index_width when the publisher sized the slot to this dict, but a sibling sink can have
+	// published the width from a smaller earlier dictionary (parquet/delta row groups carry per-chunk dictionaries).
+	// Throw, not D_ASSERT: in release the UnsafeNumericCast below silently truncates the scattered indices.
+	if (child_count > (idx_t(1) << (8 * index_width))) {
+		throw InternalException("dict-surviving join: dictionary with %llu entries exceeds the %llu-byte narrowed "
+		                        "index for column %llu; producer grew the dictionary after the slot width was "
+		                        "published",
+		                        static_cast<uint64_t>(child_count), static_cast<uint64_t>(index_width),
+		                        static_cast<uint64_t>(build_col_idx));
+	}
 	auto owned_entry = DictionaryVector::CreateReusableGlobalDictionary(upstream_child.GetType(), child_count);
 	if (child_count > 0) {
 		VectorOperations::Copy(upstream_child, owned_entry->data, child_count, 0, 0);
